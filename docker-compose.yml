@@ -1,0 +1,33 @@
+x-common: &common
+  image: registry.digitalocean.com/hypercube/ai5:v2
+  pull_policy: if_not_present
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges]
+  restart: always
+  stop_signal: SIGINT
+
+name: ai5
+
+services:
+  main:
+    <<: *common
+    build: .
+    command: ['venv/bin/python', '-u', 'src/main.py']
+    volumes:
+      - ./src:/home/app/src:ro
+      - var:/home/app/var
+      - /etc/nginx/sites/ai-bot/public:/etc/nginx/sites/ai-bot/public
+
+  debug:
+    image: registry.digitalocean.com/hypercube/ai5:v2
+    pull_policy: if_not_present
+    profiles: [disabled]
+    volumes:
+      - .:/source:ro
+      - ./src:/home/app/src:ro
+      - var:/home/app/var
+      - /etc/nginx/sites/ai-bot:/etc/nginx/sites/ai-bot
+
+volumes:
+  var:
