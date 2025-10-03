@@ -213,7 +213,7 @@ def parse_prefix(prefix):
                     if re.fullmatch(r'(?a)\d+', s):
                         model['reasoning'] = int(s)
                     else:
-                        for i, v in ['low', 'medium', 'high', 'minimal', 'none', 'dynamic']:
+                        for i in ['low', 'medium', 'high', 'minimal', 'none', 'dynamic']:
                             if i.startswith(s.lower()):
                                 model['reasoning'] = i
                                 break
@@ -815,12 +815,13 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
         for output in response['output']:
             match output['type']:
                 case 'reasoning':
-                    pass
+                    history.append(output)
                 case 'web_search_call':
                     text += '（网页搜索）'
                 case 'code_interpreter_call':
                     text += '（运行代码）'
                 case 'message':
+                    history.append(output)
                     for content in output['content']:
                         match content['type']:
                             case 'output_text':
@@ -833,7 +834,7 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
         for i in await telegram_send_text(chat_id, text, reply_to_message_id=message_id):
             db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, i, serialize_fast({
                 'type': 'history',
-                'history': history + response['output'],
+                'history': history,
                 'models': [model],
             })])
 
