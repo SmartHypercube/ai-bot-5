@@ -38,6 +38,9 @@ def init_db():
     db.execute('create table config (key text primary key, value)')
     db.execute('create table message (chat_id integer not null, message_id integer not null, data blob not null, primary key (chat_id, message_id))')
     db.execute('create table chat (chat_id integer primary key, data blob not null)')
+    db.execute('create table search_data (chat_id integer not null, message_id integer not null, text text not null, parent integer, children blob, time integer not null, primary key (chat_id, message_id))')
+    db.execute('create table message_group (chat_id integer not null, message_id integer not null, group_id integer not null, primary key (chat_id, message_id))')
+
     db.execute('insert into config (key, value) values (?, ?)', ['telegram_token', input('Telegram bot token: ').strip()])
     db.execute('insert into config (key, value) values (?, ?)', ['openai_api_key', input('OpenAI API key: ').strip()])
     db.execute('insert into config (key, value) values (?, ?)', ['gemini_api_key', input('Gemini API key: ').strip()])
@@ -115,15 +118,14 @@ async def telegram_send_text(chat_id, text, reply_to_message_id=None, markdown=T
             }
         if reply_to_message_id is not None:
             kwargs['reply_parameters'] = {'message_id': reply_to_message_id}
-        result = await telegram_api(
+        return await telegram_api(
             'sendMessage',
             chat_id=chat_id,
             link_preview_options={'is_disabled': True},
             **kwargs,
         )
-        return [result['message_id']]
     else:
-        message_ids = []
+        messages = []
         while text:
             part = text[:MESSAGE_LENGTH_LIMIT]
             text = text[MESSAGE_LENGTH_LIMIT:]
@@ -136,9 +138,11 @@ async def telegram_send_text(chat_id, text, reply_to_message_id=None, markdown=T
                 link_preview_options={'is_disabled': True},
                 **kwargs,
             )
-            message_ids.append(result['message_id'])
+            messages.append(result)
             reply_to_message_id = result['message_id']
-        return message_ids
+        for i in messages[1:]:
+            db.execute('insert into message_group (chat_id, message_id, group_id) values (?, ?, ?)', [chat_id, i['message_id'], messages[0]['message_id']])
+        return messages[0]
 
 
 async def telegram_get_file(file_id):
@@ -548,6 +552,22 @@ async def handle_select_model_message(state, message):
             raise ValueError('Invalid reply message')
 
 
+# async def handle_search_message(message):
+#     chat_id = message['chat']['id']
+#     _, *args = message.get('text', '').split()
+#     if not args:
+#         await telegram_send_text(chat_id, '用法：/search 关键词1 关键词2 ...')
+#         return
+#     state = {'type': 'search', 'args': args, 'page': }
+#     db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, message['message_id'], serialize_fast({'type': 'search', 'args': args})])
+#     like_part = ' and '.join(['text like ?'] * len(args))
+#     db.execute('select * from search_data where chat_id = ? and ' + like_part + ' order by message_id desc limit 10
+
+
+# async def handle_search_callback_query(callback_query):
+#     pass
+
+
 async def handle_message(message):
     chat_id = message['chat']['id']
     from_id = message['from']['id']
@@ -587,6 +607,9 @@ async def handle_message(message):
                 db.execute('insert into chat (chat_id, data) values (?, ?) on conflict do update set data = excluded.data', [chat_id, serialize_fast(data)])
             await telegram_send_text(chat_id, '已禁用长输出折叠功能。发送 /enable_fold 启用折叠功能。')
             return
+        # if message.get('text', '').startswith('/search'):
+        #     await handle_search_message(message)
+        #     return
 
         message_id = message['message_id']
         if 'media_group_id' in message:
@@ -596,14 +619,18 @@ async def handle_message(message):
         reply_file = None
         history = None
         models = None
+        search_data_parent = None
         if 'reply_to_message' in message:
             reply_to_message_id = message['reply_to_message']['message_id']
+            if row := db.execute('select group_id from message_group where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
+                reply_to_message_id = row[0]
             if (row := db.execute('select data from message where chat_id = ? and message_id = ?', [message['chat']['id'], reply_to_message_id]).fetchone()) is None:
                 await telegram_send_text(chat_id, '只支持回复 AI 发送的消息，或者你发送的图片或文件。', reply_to_message_id=message_id)
                 return
             match deserialize(row[0]):
                 case {'type': 'history', 'history': history, 'models': models}:
-                    pass
+                    if row := db.execute('select 1 from search_data where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
+                        search_data_parent = reply_to_message_id
                 case {'type': 'file'} as reply_file:
                     pass
                 case {'type': 'select_model', 'step': 'ready' | 'used'} as state:
@@ -668,6 +695,18 @@ async def handle_message(message):
             await telegram_send_text(chat_id, '只支持发送文字消息、图片、文本文件或 PDF 文件。', reply_to_message_id=message_id)
             return
         file = file or reply_file
+
+        db.execute('begin immediate')
+        with db:
+            db.execute('insert into search_data (chat_id, message_id, text, parent, time) values (?, ?, ?, ?, ?)', [chat_id, message_id, text or '', search_data_parent, message['date']])
+            if search_data_parent is not None:
+                parent_children, = db.execute('select children from search_data where chat_id = ? and message_id = ?', [chat_id, search_data_parent]).fetchone()
+                if parent_children is None:
+                    parent_children = []
+                else:
+                    parent_children = deserialize(parent_children)
+                parent_children.append(message_id)
+                db.execute('update search_data set children = ? where chat_id = ? and message_id = ?', [serialize_fast(parent_children), chat_id, search_data_parent])
 
         [safety_identifier_salt] = db.execute('select value from config where key = ?', ['safety_identifier_salt']).fetchone()
         if len(safety_identifier_salt) < 16:
@@ -810,6 +849,7 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
             raise RuntimeError(f'OpenAI API error: error {response["error"]}')
 
         text = ''
+        search_text = ''
         if model_index is not None:
             text += f'（模型 {model_index + 1}）'
         for output in response['output']:
@@ -826,17 +866,29 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
                         match content['type']:
                             case 'output_text':
                                 text += content['text']
+                                search_text += content['text']
                             case type:
                                 text += f'（未知内容类型：{type}）'
                 case type:
                     text += f'（未知输出类型：{type}）'
 
-        for i in await telegram_send_text(chat_id, text, reply_to_message_id=message_id):
-            db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, i, serialize_fast({
-                'type': 'history',
-                'history': history,
-                'models': [model],
-            })])
+        result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
+        db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
+            'type': 'history',
+            'history': history,
+            'models': [model],
+        })])
+
+        db.execute('begin immediate')
+        with db:
+            db.execute('insert into search_data (chat_id, message_id, text, parent, time) values (?, ?, ?, ?, ?)', [chat_id, result['message_id'], search_text, message_id, result['date']])
+            parent_children, = db.execute('select children from search_data where chat_id = ? and message_id = ?', [chat_id, message_id]).fetchone()
+            if parent_children is None:
+                parent_children = []
+            else:
+                parent_children = deserialize(parent_children)
+            parent_children.append(result['message_id'])
+            db.execute('update search_data set children = ? where chat_id = ? and message_id = ?', [serialize_fast(parent_children), chat_id, message_id])
 
     except Exception:
         if strict_privacy:
@@ -918,6 +970,7 @@ async def complete_and_reply_gemini(chat_id, message_id, model_index, model, his
             raise RuntimeError('Gemini API error: no candidates')
 
         text = ''
+        search_text = ''
         if model_index is not None:
             text += f'（模型 {model_index + 1}）'
         content = response['candidates'][0]['content']
@@ -929,18 +982,30 @@ async def complete_and_reply_gemini(chat_id, message_id, model_index, model, his
                     pass
                 case {'text': s}:
                     text += s
+                    search_text += s
                 case _:
                     if len(part) == 1:
                         text += f'（未知内容类型：{next(iter(part))}）'
                     else:
                         text += f'（未知内容类型：{part}）'
 
-        for i in await telegram_send_text(chat_id, text, reply_to_message_id=message_id):
-            db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, i, serialize_fast({
-                'type': 'history',
-                'history': history + [content],
-                'models': [model],
-            })])
+        result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
+        db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
+            'type': 'history',
+            'history': history + [content],
+            'models': [model],
+        })])
+
+        db.execute('begin immediate')
+        with db:
+            db.execute('insert into search_data (chat_id, message_id, text, parent, time) values (?, ?, ?, ?, ?)', [chat_id, result['message_id'], search_text, message_id, result['date']])
+            parent_children, = db.execute('select children from search_data where chat_id = ? and message_id = ?', [chat_id, message_id]).fetchone()
+            if parent_children is None:
+                parent_children = []
+            else:
+                parent_children = deserialize(parent_children)
+            parent_children.append(result['message_id'])
+            db.execute('update search_data set children = ? where chat_id = ? and message_id = ?', [serialize_fast(parent_children), chat_id, message_id])
 
     except Exception:
         if strict_privacy:
