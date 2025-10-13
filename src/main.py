@@ -333,13 +333,10 @@ async def render_select_model_state(state, chat_id, message_id=None):
                 ],
             }
         case {'step': 'model-input'}:
-            kwargs['text'] = '请回复 OpenAI 或 Gemini 模型名称'
-            kwargs['reply_markup'] = {'force_reply': True, 'input_field_placeholder': 'gpt-... / gemini-...'}
-        case {'step': 'model-re-input'}:
-            kwargs['text'] = '模型名称必须以 gpt- 或 gemini- 开头，请重新输入'
+            kwargs['text'] = state.get('error', '请回复 OpenAI 或 Gemini 模型名称')
             kwargs['reply_markup'] = {'force_reply': True, 'input_field_placeholder': 'gpt-... / gemini-...'}
         case {'step': 'system-input'}:
-            kwargs['text'] = '请回复系统提示'
+            kwargs['text'] = state.get('error', '请回复系统提示。如果超过 4096 字符，必须以文本文件形式发送')
             kwargs['reply_markup'] = {'force_reply': True, 'input_field_placeholder': '你是一个...'}
         case {'step': 'ready' | 'used' | 'invalid'}:
             lines = ['基础模型：' + escape_html(state['model'])]
@@ -361,8 +358,11 @@ async def render_select_model_state(state, chat_id, message_id=None):
                 lines.append('查看网页：' + ('开' if 'w' in state.get('tools', '') else '关'))
             lines.append('运行代码：' + ('开' if 'c' in state.get('tools', '') else '关'))
             if 'system' in state:
+                text = state['system']
+                if len(text) > 2002:
+                    text = text[:2000] + '……'
                 lines.append('系统提示：')
-                lines.append('<blockquote expandable>' + escape_html(state['system']) + '</blockquote>')
+                lines.append('<blockquote expandable>' + escape_html(text) + '</blockquote>')
             else:
                 lines.append('系统提示：无')
             lines.append('')
@@ -561,21 +561,57 @@ async def handle_select_model_callback_query(state, callback_query):
 async def handle_select_model_message(state, message):
     assert state['type'] == 'select_model'
     chat_id = message['chat']['id']
-    text = message['text']
+    # if 'photo' in message:
+    #     state['error'] = '不支持使用图片作为系统提示，请回复文本消息或文本文件作为系统提示'
+    #     await render_select_model_state(state, chat_id)
+    #     return
+    # if 'document' in message:
+    #     if message.get('text', '').strip():
+    #         state['error'] = '发送文本文件时请不要在消息中添加其他内容，请回复文本文件作为系统提示'
+    #         await telegram_send_text(chat_id, '请回复你发送的文档。', reply_to_message_id=message_id)
+    # text = message['text']
     match state['step']:
-        case 'model-input' | 'model-re-input':
-            model = text.strip().lower()
-            if model.startswith(('gpt-', 'gemini-')) and re.fullmatch(r'(?a)[\w.-]+', model):
-                state['model'] = model
-                state['step'] = 'ready'
-                select_model_after_change_model(state)
-                select_model_check_invalid(state)
-            else:
-                state['step'] = 'model-re-input'
+        case 'model-input':
+            if 'photo' in message or 'document' in message:
+                state['error'] = '请回复文本消息作为模型名称'
+                await render_select_model_state(state, chat_id)
+                return
+            model = message['text'].strip().lower()
+            if not model.startswith(('gpt-', 'gemini-')):
+                state['error'] = '模型名称必须以 gpt- 或 gemini- 开头，请重新输入'
+                await render_select_model_state(state, chat_id)
+                return
+            if not re.fullmatch(r'(?a)[\w.-]+', model):
+                state['error'] = f'模型名称只能包含字母、数字、点号、下划线和连字符，请重新输入'
+                await render_select_model_state(state, chat_id)
+                return
+            state['model'] = model
+            state['step'] = 'ready'
+            state.pop('error', None)
+            select_model_after_change_model(state)
+            select_model_check_invalid(state)
             await render_select_model_state(state, chat_id)
         case 'system-input':
+            if 'photo' in message:
+                state['error'] = '不支持使用图片作为系统提示，请回复文本消息或文本文件作为系统提示'
+                await render_select_model_state(state, chat_id)
+                return
+            elif 'document' in message:
+                if message.get('text', '').strip():
+                    state['error'] = '不支持发送带额外文本消息的文件作为系统提示，请回复文本消息或文本文件作为系统提示'
+                    await render_select_model_state(state, chat_id)
+                    return
+                if not message['document'].get('mime_type', '').startswith('text/'):
+                    state['error'] = '不支持使用非文本文件作为系统提示，请回复文本消息或文本文件作为系统提示'
+                    await render_select_model_state(state, chat_id)
+                    return
+                file_id = message['document']['file_id']
+                text = (await telegram_get_file(file_id)).decode(errors='replace')
+            else:
+                text = message.get('text', '')
             state['system'] = text.strip()
             state['step'] = 'ready'
+            state.pop('error', None)
             await render_select_model_state(state, chat_id)
         case _:
             raise ValueError('Invalid reply message')
@@ -645,41 +681,6 @@ async def handle_message(message):
             await telegram_send_text(chat_id, '只支持每次发送一张图片或一个文件。', reply_to_message_id=message_id)
             return
 
-        reply_file = None
-        history = None
-        models = None
-        search_data_parent = None
-        if 'reply_to_message' in message:
-            reply_to_message_id = message['reply_to_message']['message_id']
-            if row := db.execute('select group_id from message_group where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
-                reply_to_message_id = row[0]
-            if (row := db.execute('select data from message where chat_id = ? and message_id = ?', [message['chat']['id'], reply_to_message_id]).fetchone()) is None:
-                await telegram_send_text(chat_id, '只支持回复 AI 发送的消息，或者你发送的图片或文件。', reply_to_message_id=message_id)
-                return
-            match deserialize(row[0]):
-                case {'type': 'history', 'history': history, 'models': models}:
-                    if row := db.execute('select 1 from search_data where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
-                        search_data_parent = reply_to_message_id
-                case {'type': 'file'} as reply_file:
-                    pass
-                case {'type': 'select_model', 'step': 'ready' | 'used'} as state:
-                    if state['step'] == 'ready':
-                        state['step'] = 'used'
-                        db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?) on conflict do update set data = excluded.data', [chat_id, reply_to_message_id, serialize_fast(state)])
-                    models = [{k: v for k, v in state.items() if k in {'model', 'reasoning', 'verbosity', 'tools', 'system'}}]
-                case {'type': 'select_model', 'step': 'model-input' | 'model-re-input' | 'system-input'} as state:
-                    await handle_select_model_message(state, message)
-                    return
-                case {'type': 'select_model', 'step': _}:
-                    await telegram_send_text(chat_id, '模型选择尚未完成。', reply_to_message_id=message_id)
-                    return
-                case _:
-                    assert False
-
-        if reply_file and ('photo' in message or 'document' in message):
-            await telegram_send_text(chat_id, '回复你发送的图片或文件时只支持发送文字消息。', reply_to_message_id=message_id)
-            return
-
         file = None
         if 'photo' in message:
             file_id = max(message['photo'], key=lambda i: i['file_size'])['file_id']
@@ -703,6 +704,41 @@ async def handle_message(message):
                 file['name'] = message['document']['file_name']
         if file:
             db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, message_id, serialize_fast(file)])
+
+        reply_file = None
+        history = None
+        models = None
+        search_data_parent = None
+        if 'reply_to_message' in message:
+            reply_to_message_id = message['reply_to_message']['message_id']
+            if row := db.execute('select group_id from message_group where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
+                reply_to_message_id = row[0]
+            if (row := db.execute('select data from message where chat_id = ? and message_id = ?', [message['chat']['id'], reply_to_message_id]).fetchone()) is None:
+                await telegram_send_text(chat_id, '只支持回复 AI 发送的消息，或者你发送的图片或文件。', reply_to_message_id=message_id)
+                return
+            match deserialize(row[0]):
+                case {'type': 'history', 'history': history, 'models': models}:
+                    if row := db.execute('select 1 from search_data where chat_id = ? and message_id = ?', [chat_id, reply_to_message_id]).fetchone():
+                        search_data_parent = reply_to_message_id
+                case {'type': 'file'} as reply_file:
+                    pass
+                case {'type': 'select_model', 'step': 'ready' | 'used'} as state:
+                    if state['step'] == 'ready':
+                        state['step'] = 'used'
+                        db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?) on conflict do update set data = excluded.data', [chat_id, reply_to_message_id, serialize_fast(state)])
+                    models = [{k: v for k, v in state.items() if k in {'model', 'reasoning', 'verbosity', 'tools', 'system'}}]
+                case {'type': 'select_model', 'step': 'model-input' | 'system-input'} as state:
+                    await handle_select_model_message(state, message)
+                    return
+                case {'type': 'select_model', 'step': _}:
+                    await telegram_send_text(chat_id, '模型选择尚未完成。', reply_to_message_id=message_id)
+                    return
+                case _:
+                    assert False
+
+        if reply_file and ('photo' in message or 'document' in message):
+            await telegram_send_text(chat_id, '回复你发送的图片或文件时只支持发送文字消息。', reply_to_message_id=message_id)
+            return
 
         text = message.get('text', '') + message.get('caption', '')
         if '$' in text.split('\n', 1)[0]:
