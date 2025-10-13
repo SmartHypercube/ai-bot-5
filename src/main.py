@@ -233,11 +233,19 @@ def parse_prefix(prefix):
                             break
                     else:
                         raise ValueError(f'Unknown verbosity: {arg[1:]}')
-                case 't', _:
+                case 't', 'gpt':
                     s = arg[1:].strip()
                     if len(set(s)) != len(s):
                         raise ValueError(f'Duplicate tool options: {arg[1:]}')
                     if set(s) - {'s', 'c'}:
+                        raise ValueError(f'Unknown tool options: {arg[1:]}')
+                    if s:
+                        model['tools'] = s
+                case 't', 'gemini':
+                    s = arg[1:].strip()
+                    if len(set(s)) != len(s):
+                        raise ValueError(f'Duplicate tool options: {arg[1:]}')
+                    if set(s) - {'s', 'w', 'c'}:
                         raise ValueError(f'Unknown tool options: {arg[1:]}')
                     if s:
                         model['tools'] = s
@@ -348,7 +356,9 @@ async def render_select_model_state(state, chat_id, message_id=None):
                     v = gemini_reasoning_to_number(state['model'], state['reasoning'])
                     s = {'none': f'无（{v}）', 'minimal': f'最低（{v}）', 'low': f'低（{v}）', 'medium': f'中（{v}）', 'high': f'高（{v}）', 'dynamic': '自动决定'}[state['reasoning']]
                     lines.append(f'推理努力：{s}')
-            lines.append('网页搜索：' + ('开' if 's' in state.get('tools', '') else '关'))
+            lines.append('在线搜索：' + ('开' if 's' in state.get('tools', '') else '关'))
+            if model_type == 'gemini':
+                lines.append('查看网页：' + ('开' if 'w' in state.get('tools', '') else '关'))
             lines.append('运行代码：' + ('开' if 'c' in state.get('tools', '') else '关'))
             if 'system' in state:
                 lines.append('系统提示：')
@@ -379,6 +389,16 @@ async def render_select_model_state(state, chat_id, message_id=None):
                     {'text': 'medium', 'callback_data': 'v/medium'},
                     {'text': 'high', 'callback_data': 'v/high'},
                 ])
+                keyboard.append([
+                    {
+                        True: {'text': '在线搜索关', 'callback_data': 'tn/s'},
+                        False: {'text': '在线搜索开', 'callback_data': 'ty/s'},
+                    }['s' in state.get('tools', '')],
+                    {
+                        True: {'text': '运行代码关', 'callback_data': 'tn/c'},
+                        False: {'text': '运行代码开', 'callback_data': 'ty/c'},
+                    }['c' in state.get('tools', '')],
+                ])
             elif model_type == 'gemini':
                 l = [
                     {'text': '推理：', 'callback_data': 'r/'},
@@ -393,16 +413,20 @@ async def render_select_model_state(state, chat_id, message_id=None):
                     {'text': '高', 'callback_data': 'r/high'},
                 ]
                 keyboard.append(l)
-            keyboard.append([
-                {
-                    True: {'text': '禁用网页搜索', 'callback_data': 'tn/s'},
-                    False: {'text': '启用网页搜索', 'callback_data': 'ty/s'},
-                }['s' in state.get('tools', '')],
-                {
-                    True: {'text': '禁用运行代码', 'callback_data': 'tn/c'},
-                    False: {'text': '启用运行代码', 'callback_data': 'ty/c'},
-                }['c' in state.get('tools', '')],
-            ])
+                keyboard.append([
+                    {
+                        True: {'text': '在线搜索关', 'callback_data': 'tn/s'},
+                        False: {'text': '在线搜索开', 'callback_data': 'ty/s'},
+                    }['s' in state.get('tools', '')],
+                    {
+                        True: {'text': '查看网页关', 'callback_data': 'tn/w'},
+                        False: {'text': '查看网页开', 'callback_data': 'ty/w'},
+                    }['w' in state.get('tools', '')],
+                    {
+                        True: {'text': '运行代码关', 'callback_data': 'tn/c'},
+                        False: {'text': '运行代码开', 'callback_data': 'ty/c'},
+                    }['c' in state.get('tools', '')],
+                ])
             keyboard.append([
                 {'text': '清除系统提示', 'callback_data': 's/'},
                 {'text': '修改系统提示', 'callback_data': 's/_change'},
@@ -428,6 +452,10 @@ def select_model_after_change_model(state):
                 del state['reasoning']
             case 'none':
                 state['reasoning'] = 'minimal'
+        if 'w' in state.get('tools', ''):
+            state['tools'] = state['tools'].replace('w', '')
+            if not state['tools']:
+                del state['tools']
     elif model_type == 'gemini':
         state.pop('verbosity', None)
 
@@ -947,6 +975,7 @@ async def complete_and_reply_gemini(chat_id, message_id, model_short_name, model
                 match i:
                     case 's':
                         kwargs['tools'].append({'googleSearch': {}})
+                    case 'w':
                         kwargs['tools'].append({'urlContext': {}})
                     case 'c':
                         kwargs['tools'].append({'codeExecution': {}})
