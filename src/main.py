@@ -254,7 +254,7 @@ def parse_prefix(prefix):
     return models
 
 
-def format_prefix(models):
+def format_prefix(models, omit_system=False):
     parts = []
     for model in models:
         s = model['model']
@@ -276,9 +276,10 @@ def format_prefix(models):
         if 'tools' in model:
             s += '+t' + model['tools']
         if 'system' in model:
-            if '+' in model['system'] or ',' in model['system'] or '$' in model['system']:
-                return None
-            s += '+s' + model['system']
+            if not omit_system:
+                if '+' in model['system'] or ',' in model['system'] or '$' in model['system']:
+                    return None
+                s += '+s' + model['system']
         parts.append(s)
     return ','.join(parts)
 
@@ -712,13 +713,12 @@ async def handle_message(message):
         if len(safety_identifier_salt) < 16:
             raise ValueError('safety_identifier_salt too short')
         safety_identifier = hashlib.sha256(f'{safety_identifier_salt},{from_id}'.encode()).hexdigest()
-        for i, model in enumerate(models):
-            if len(models) == 1:
-                i = None
+        for model in models:
+            model_short_name = format_prefix([model], omit_system=True)
             if model['model'].startswith('gpt-'):
-                asyncio.create_task(complete_and_reply_gpt(chat_id, message_id, i, model, history, file, text, safety_identifier, strict_privacy))
+                asyncio.create_task(complete_and_reply_gpt(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
             elif model['model'].startswith('gemini-'):
-                asyncio.create_task(complete_and_reply_gemini(chat_id, message_id, i, model, history, file, text, safety_identifier, strict_privacy))
+                asyncio.create_task(complete_and_reply_gemini(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
             else:
                 assert False
 
@@ -769,7 +769,7 @@ async def handle_callback_query(callback_query):
         )
 
 
-async def complete_and_reply_gpt(chat_id, message_id, model_index, model, history, file, text, safety_identifier, strict_privacy):
+async def complete_and_reply_gpt(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
     try:
         if 'system' in model:
             assert history is None
@@ -848,18 +848,16 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
         if response['error'] is not None:
             raise RuntimeError(f'OpenAI API error: error {response["error"]}')
 
-        text = ''
+        text = f'[{model_short_name}]'
         search_text = ''
-        if model_index is not None:
-            text += f'（模型 {model_index + 1}）'
         for output in response['output']:
             match output['type']:
                 case 'reasoning':
                     history.append(output)
                 case 'web_search_call':
-                    text += '（网页搜索）'
+                    text += '[网页搜索]'
                 case 'code_interpreter_call':
-                    text += '（运行代码）'
+                    text += '[运行代码]'
                 case 'message':
                     history.append(output)
                     for content in output['content']:
@@ -868,9 +866,9 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
                                 text += content['text']
                                 search_text += content['text']
                             case type:
-                                text += f'（未知内容类型：{type}）'
+                                text += f'[未知内容类型：{type}]'
                 case type:
-                    text += f'（未知输出类型：{type}）'
+                    text += f'[未知输出类型：{type}]'
 
         result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
         db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
@@ -903,7 +901,7 @@ async def complete_and_reply_gpt(chat_id, message_id, model_index, model, histor
             await telegram_send_text(chat_id, '出错了，请重试。')
 
 
-async def complete_and_reply_gemini(chat_id, message_id, model_index, model, history, file, text, safety_identifier, strict_privacy):
+async def complete_and_reply_gemini(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
     try:
         if history is None:
             history = []
@@ -969,15 +967,13 @@ async def complete_and_reply_gemini(chat_id, message_id, model_index, model, his
         if 'candidates' not in response or len(response['candidates']) != 1:
             raise RuntimeError('Gemini API error: no candidates')
 
-        text = ''
+        text = f'[{model_short_name}]'
         search_text = ''
-        if model_index is not None:
-            text += f'（模型 {model_index + 1}）'
         content = response['candidates'][0]['content']
         for part in content['parts']:
             match part:
                 case {'executableCode': _}:
-                    text += '（运行代码）'
+                    text += '[运行代码]'
                 case {'codeExecutionResult': _}:
                     pass
                 case {'text': s}:
@@ -985,9 +981,9 @@ async def complete_and_reply_gemini(chat_id, message_id, model_index, model, his
                     search_text += s
                 case _:
                     if len(part) == 1:
-                        text += f'（未知内容类型：{next(iter(part))}）'
+                        text += f'[未知内容类型：{next(iter(part))}]'
                     else:
-                        text += f'（未知内容类型：{part}）'
+                        text += f'[未知内容类型：{part}]'
 
         result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
         db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
