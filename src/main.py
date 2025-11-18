@@ -182,6 +182,7 @@ def parse_prefix(prefix):
         s, *args = part.split('+')
         s = s.strip()
         model = {
+            '51': 'gpt-5.1',
             '5': 'gpt-5',
             '5m': 'gpt-5-mini',
             '5n': 'gpt-5-nano',
@@ -204,7 +205,7 @@ def parse_prefix(prefix):
                     s = arg[1:].strip()
                     if not s:
                         raise ValueError('Missing reasoning effort')
-                    for i in ['low', 'medium', 'high', 'minimal']:
+                    for i in ['low', 'medium', 'high', 'minimal', 'none']:
                         if i.startswith(s.lower()):
                             model['reasoning'] = i
                             break
@@ -267,6 +268,7 @@ def format_prefix(models, omit_system=False):
     for model in models:
         s = model['model']
         s = {
+            'gpt-5.1': '51',
             'gpt-5': '5',
             'gpt-5-mini': '5m',
             'gpt-5-nano': '5n',
@@ -316,7 +318,7 @@ async def render_select_model_state(state, chat_id, message_id=None):
             kwargs['reply_markup'] = {
                 'inline_keyboard': [
                     [
-                        {'text': 'gpt-5', 'callback_data': 'm/gpt-5'},
+                        {'text': 'gpt-5.1', 'callback_data': 'm/gpt-5.1'},
                         {'text': 'gpt-5-mini', 'callback_data': 'm/gpt-5-mini'},
                         {'text': 'gpt-5-nano', 'callback_data': 'm/gpt-5-nano'},
                     ],
@@ -342,7 +344,10 @@ async def render_select_model_state(state, chat_id, message_id=None):
             lines = ['基础模型：' + escape_html(state['model'])]
             model_type = state['model'].split('-', 1)[0]
             if model_type == 'gpt':
-                lines.append('推理努力：' + state.get('reasoning', '不指定（默认 medium）'))
+                if state['model'] == 'gpt-5.1':
+                    lines.append('推理努力：' + state.get('reasoning', '不指定（默认 none）'))
+                else:
+                    lines.append('推理努力：' + state.get('reasoning', '不指定（默认 medium）'))
                 lines.append('输出长度：' + state.get('verbosity', '不指定（默认 medium）'))
             elif model_type == 'gemini':
                 if 'reasoning' not in state:
@@ -376,13 +381,22 @@ async def render_select_model_state(state, chat_id, message_id=None):
             keyboard = []
             keyboard.append([{'text': '修改基础模型', 'callback_data': 'm/_change'}])
             if model_type == 'gpt':
-                keyboard.append([
-                    {'text': '推理：', 'callback_data': 'r/'},
-                    {'text': 'minimal', 'callback_data': 'r/minimal'},
-                    {'text': 'low', 'callback_data': 'r/low'},
-                    {'text': 'medium', 'callback_data': 'r/medium'},
-                    {'text': 'high', 'callback_data': 'r/high'},
-                ])
+                if state['model'] == 'gpt-5.1':
+                    keyboard.append([
+                        {'text': '推理：', 'callback_data': 'r/'},
+                        {'text': 'none', 'callback_data': 'r/none'},
+                        {'text': 'low', 'callback_data': 'r/low'},
+                        {'text': 'medium', 'callback_data': 'r/medium'},
+                        {'text': 'high', 'callback_data': 'r/high'},
+                    ])
+                else:
+                    keyboard.append([
+                        {'text': '推理：', 'callback_data': 'r/'},
+                        {'text': 'minimal', 'callback_data': 'r/minimal'},
+                        {'text': 'low', 'callback_data': 'r/low'},
+                        {'text': 'medium', 'callback_data': 'r/medium'},
+                        {'text': 'high', 'callback_data': 'r/high'},
+                    ])
                 keyboard.append([
                     {'text': '长度：', 'callback_data': 'v/'},
                     {'text': 'low', 'callback_data': 'v/low'},
@@ -447,11 +461,18 @@ async def render_select_model_state(state, chat_id, message_id=None):
 def select_model_after_change_model(state):
     model_type = state['model'].split('-', 1)[0]
     if model_type == 'gpt':
-        match state.get('reasoning', None):
-            case 'dynamic':
-                del state['reasoning']
-            case 'none':
-                state['reasoning'] = 'minimal'
+        if state['model'] == 'gpt-5.1':
+            match state.get('reasoning', None):
+                case 'minimal':
+                    state['reasoning'] = 'none'
+                case 'dynamic':
+                    state['reasoning'] = 'medium'
+        else:
+            match state.get('reasoning', None):
+                case 'dynamic':
+                    del state['reasoning']
+                case 'none':
+                    state['reasoning'] = 'minimal'
         if 'w' in state.get('tools', ''):
             state['tools'] = state['tools'].replace('w', '')
             if not state['tools']:
