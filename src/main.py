@@ -182,6 +182,7 @@ def parse_prefix(prefix):
         s, *args = part.split('+')
         s = s.strip()
         model = {
+            '52': 'gpt-5.2',
             '51': 'gpt-5.1',
             '5': 'gpt-5',
             '5m': 'gpt-5-mini',
@@ -205,7 +206,7 @@ def parse_prefix(prefix):
                     s = arg[1:].strip()
                     if not s:
                         raise ValueError('Missing reasoning effort')
-                    for i in ['low', 'medium', 'high', 'minimal', 'none']:
+                    for i in ['low', 'medium', 'high', 'minimal', 'none', 'xhigh']:
                         if i.startswith(s.lower()):
                             model['reasoning'] = i
                             break
@@ -218,7 +219,7 @@ def parse_prefix(prefix):
                     if re.fullmatch(r'(?a)\d+', s):
                         model['reasoning'] = int(s)
                     else:
-                        for i in ['low', 'medium', 'high', 'minimal', 'none', 'dynamic']:
+                        for i in ['low', 'medium', 'high', 'minimal', 'none', 'dynamic', 'xhigh']:
                             if i.startswith(s.lower()):
                                 model['reasoning'] = i
                                 break
@@ -268,6 +269,7 @@ def format_prefix(models, omit_system=False):
     for model in models:
         s = model['model']
         s = {
+            'gpt-5.2': '52',
             'gpt-5.1': '51',
             'gpt-5': '5',
             'gpt-5-mini': '5m',
@@ -280,7 +282,7 @@ def format_prefix(models, omit_system=False):
             if isinstance(model['reasoning'], int):
                 s += '+r' + str(model['reasoning'])
             else:
-                s += '+r' + {'low': 'l', 'medium': 'm', 'high': 'h', 'minimal': 'min', 'none': 'n', 'dynamic': 'd'}[model['reasoning']]
+                s += '+r' + {'low': 'l', 'medium': 'm', 'high': 'h', 'minimal': 'min', 'none': 'n', 'dynamic': 'd', 'xhigh': 'x'}[model['reasoning']]
         if 'verbosity' in model:
             s += '+v' + {'low': 'l', 'medium': 'm', 'high': 'h'}[model['verbosity']]
         if 'tools' in model:
@@ -298,12 +300,12 @@ def gemini_reasoning_to_number(model, reasoning):
     if isinstance(reasoning, int):
         return reasoning
     match model, reasoning:
-        case 'gemini-2.5-pro', 'high':
+        case 'gemini-2.5-pro', 'high' | 'xhigh':
             return 32768
         case 'gemini-2.5-flash-lite', 'minimal':
             return 512
         case _:
-            return {'none': 0, 'minimal': 128, 'low': 1024, 'medium': 8192, 'high': 24576, 'dynamic': -1}[reasoning]
+            return {'none': 0, 'minimal': 128, 'low': 1024, 'medium': 8192, 'high': 24576, 'dynamic': -1, 'xhigh': 24576}[reasoning]
 
 
 async def render_select_model_state(state, chat_id, message_id=None):
@@ -318,7 +320,7 @@ async def render_select_model_state(state, chat_id, message_id=None):
             kwargs['reply_markup'] = {
                 'inline_keyboard': [
                     [
-                        {'text': 'gpt-5.1', 'callback_data': 'm/gpt-5.1'},
+                        {'text': 'gpt-5.2', 'callback_data': 'm/gpt-5.2'},
                         {'text': 'gpt-5-mini', 'callback_data': 'm/gpt-5-mini'},
                         {'text': 'gpt-5-nano', 'callback_data': 'm/gpt-5-nano'},
                     ],
@@ -344,7 +346,7 @@ async def render_select_model_state(state, chat_id, message_id=None):
             lines = ['基础模型：' + escape_html(state['model'])]
             model_type = state['model'].split('-', 1)[0]
             if model_type == 'gpt':
-                if state['model'] == 'gpt-5.1':
+                if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
                     lines.append('推理努力：' + state.get('reasoning', '不指定（默认 none）'))
                 else:
                     lines.append('推理努力：' + state.get('reasoning', '不指定（默认 medium）'))
@@ -356,7 +358,7 @@ async def render_select_model_state(state, chat_id, message_id=None):
                     lines.append(f'推理努力：{state["reasoning"]}')
                 else:
                     v = gemini_reasoning_to_number(state['model'], state['reasoning'])
-                    s = {'none': f'无（{v}）', 'minimal': f'最低（{v}）', 'low': f'低（{v}）', 'medium': f'中（{v}）', 'high': f'高（{v}）', 'dynamic': '自动决定'}[state['reasoning']]
+                    s = {'none': f'无（{v}）', 'minimal': f'最低（{v}）', 'low': f'低（{v}）', 'medium': f'中（{v}）', 'high': f'高（{v}）', 'dynamic': '自动决定', 'xhigh': f'极高（{v}）'}[state['reasoning']]
                     lines.append(f'推理努力：{s}')
             lines.append('在线搜索：' + ('开' if 's' in state.get('tools', '') else '关'))
             if model_type == 'gemini':
@@ -381,22 +383,21 @@ async def render_select_model_state(state, chat_id, message_id=None):
             keyboard = []
             keyboard.append([{'text': '修改基础模型', 'callback_data': 'm/_change'}])
             if model_type == 'gpt':
-                if state['model'] == 'gpt-5.1':
-                    keyboard.append([
-                        {'text': '推理：', 'callback_data': 'r/'},
-                        {'text': 'none', 'callback_data': 'r/none'},
-                        {'text': 'low', 'callback_data': 'r/low'},
-                        {'text': 'medium', 'callback_data': 'r/medium'},
-                        {'text': 'high', 'callback_data': 'r/high'},
-                    ])
+                l = [
+                    {'text': '推理：', 'callback_data': 'r/'},
+                ]
+                if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
+                    l.append({'text': 'none', 'callback_data': 'r/none'})
                 else:
-                    keyboard.append([
-                        {'text': '推理：', 'callback_data': 'r/'},
-                        {'text': 'minimal', 'callback_data': 'r/minimal'},
-                        {'text': 'low', 'callback_data': 'r/low'},
-                        {'text': 'medium', 'callback_data': 'r/medium'},
-                        {'text': 'high', 'callback_data': 'r/high'},
-                    ])
+                    l.append({'text': 'minimal', 'callback_data': 'r/minimal'})
+                l += [
+                    {'text': 'low', 'callback_data': 'r/low'},
+                    {'text': 'medium', 'callback_data': 'r/medium'},
+                    {'text': 'high', 'callback_data': 'r/high'},
+                ]
+                if state['model'] == 'gpt-5.2':
+                    l.append({'text': 'xhigh', 'callback_data': 'r/xhigh'})
+                keyboard.append(l)
                 keyboard.append([
                     {'text': '长度：', 'callback_data': 'v/'},
                     {'text': 'low', 'callback_data': 'v/low'},
@@ -461,7 +462,7 @@ async def render_select_model_state(state, chat_id, message_id=None):
 def select_model_after_change_model(state):
     model_type = state['model'].split('-', 1)[0]
     if model_type == 'gpt':
-        if state['model'] == 'gpt-5.1':
+        if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
             match state.get('reasoning', None):
                 case 'minimal':
                     state['reasoning'] = 'none'
