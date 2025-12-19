@@ -1,6 +1,7 @@
 import aiohttp
 import asyncio
 import base64
+import dataclasses
 import hashlib
 import msgpack
 import pathlib
@@ -172,6 +173,314 @@ def get_strict_privacy_users():
     return result
 
 
+@dataclasses.dataclass(frozen=True)
+class BaseModel:
+    name: str
+    short_name: str
+    reasoning_options: list[str]
+    default_reasoning: str | None
+
+    async def complete(self, model_short_name, model, history, file, text, safety_identifier):
+        raise NotImplementedError
+
+    def translate_reasoning(self, v):
+        return {
+            'dynamic': '自动',
+            'none': '无',
+            'minimal': '最低',
+            'low': '低',
+            'medium': '中',
+            'high': '高',
+            'xhigh': '极高',
+        }[v]
+
+    def display_reasoning(self, model):
+        if 'reasoning' in model:
+            return f'{self.translate_reasoning(model["reasoning"])}（{model["reasoning"]}）'
+        if self.default_reasoning is None:
+            return '不指定'
+        return f'不指定，默认{self.translate_reasoning(self.default_reasoning)}（{self.default_reasoning}）'
+
+
+@dataclasses.dataclass(frozen=True)
+class BaseModelGPT5(BaseModel):
+    async def complete(self, model_short_name, model, history, file, text, safety_identifier):
+        if 'system' in model:
+            assert history is None
+            if model['system']:
+                history = [{'role': 'system', 'content': [{'type': 'input_text', 'text': model['system']}]}]
+            del model['system']
+        if history is None:
+            history = []
+
+        content = []
+        if file:
+            if file['mime_type'].startswith('image/'):
+                content.append({
+                    'type': 'input_image',
+                    'image_url': f'data:{file["mime_type"]};base64,' + base64.b64encode(file['data']).decode(),
+                    'detail': 'high',
+                })
+            elif file['mime_type'] == 'application/pdf':
+                content.append({
+                    'type': 'input_file',
+                    'file_data': f'data:{file["mime_type"]};base64,' + base64.b64encode(file['data']).decode(),
+                } | ({'filename': file['name']} if 'name' in file else {}))
+            elif file['mime_type'].startswith('text/'):
+                if text:
+                    text = file['data'].decode(errors='replace') + '\n\n' + text
+                else:
+                    text = file['data'].decode(errors='replace')
+                content.append({
+                    'type': 'input_text',
+                    'text': text,
+                })
+                text = None
+            else:
+                assert False
+        if text:
+            content.append({
+                'type': 'input_text',
+                'text': text,
+            })
+        history.append({'role': 'user', 'content': content})
+
+        [openai_api_key] = db.execute('select value from config where key = ?', ['openai_api_key']).fetchone()
+        kwargs = {
+            'model': self.name,
+            'include': ['reasoning.encrypted_content'],
+            'input': history,
+            'safety_identifier': safety_identifier,
+            'store': False,
+        }
+        if 'reasoning' in model:
+            kwargs['reasoning'] = {'effort': model['reasoning']}
+        if 'verbosity' in model:
+            kwargs['text'] = {'verbosity': model['verbosity']}
+        if 'tools' in model:
+            kwargs['tools'] = []
+            for i in model['tools']:
+                match i:
+                    case 's':
+                        kwargs['tools'].append({'type': 'web_search', 'search_context_size': 'high'})
+                    case 'c':
+                        kwargs['tools'].append({'type': 'code_interpreter', 'container': {'type': 'auto'}})
+                    case _:
+                        raise ValueError(f'Unknown tool option: {i}')
+
+        async with session.post(
+            'https://api.openai.com/v1/responses',
+            headers={'Authorization': f'Bearer {openai_api_key}'},
+            json=kwargs,
+            timeout=aiohttp.ClientTimeout(total=3600),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f'OpenAI API error: {response.status} {await response.text()}')
+            response = await response.json()
+        if response['status'] != 'completed':
+            raise RuntimeError(f'OpenAI API error: status {response["status"]}')
+        if response['error'] is not None:
+            raise RuntimeError(f'OpenAI API error: error {response["error"]}')
+
+        text = f'[{model_short_name}]'
+        search_text = ''
+        for output in response['output']:
+            match output['type']:
+                case 'reasoning':
+                    history.append(output)
+                case 'web_search_call':
+                    text += '[网页搜索]'
+                case 'code_interpreter_call':
+                    text += '[运行代码]'
+                case 'message':
+                    history.append(output)
+                    for content in output['content']:
+                        match content['type']:
+                            case 'output_text':
+                                text += content['text']
+                                search_text += content['text']
+                            case type:
+                                text += f'[未知内容类型：{type}]'
+                case type:
+                    text += f'[未知输出类型：{type}]'
+        return history, text, search_text
+
+
+@dataclasses.dataclass(frozen=True)
+class BaseModelGemini(BaseModel):
+    def thinking_config(self, model):
+        raise NotImplementedError
+
+    async def complete(self, model_short_name, model, history, file, text, safety_identifier):
+        if history is None:
+            history = []
+
+        parts = []
+        if file:
+            if file['mime_type'].startswith('image/') or file['mime_type'] == 'application/pdf':
+                parts.append({
+                    'inline_data': {
+                        'mime_type': file['mime_type'],
+                        'data': base64.b64encode(file['data']).decode(),
+                    },
+                })
+            elif file['mime_type'].startswith('text/'):
+                if text:
+                    text = file['data'].decode(errors='replace') + '\n\n' + text
+                else:
+                    text = file['data'].decode(errors='replace')
+                parts.append({'text': text})
+                text = None
+            else:
+                assert False
+        if text:
+            parts.append({'text': text})
+        history.append({'role': 'user', 'parts': parts})
+
+        [gemini_api_key] = db.execute('select value from config where key = ?', ['gemini_api_key']).fetchone()
+        kwargs = {
+            'contents': history,
+            'safetySettings': [
+                {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'OFF'},
+                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'OFF'},
+                {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'OFF'},
+                {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'OFF'},
+                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'OFF'},
+            ],
+        }
+        if 'reasoning' in model:
+            kwargs['generationConfig'] = {'thinkingConfig': self.thinking_config(model)}
+        if 'tools' in model:
+            kwargs['tools'] = []
+            for i in model['tools']:
+                match i:
+                    case 's':
+                        kwargs['tools'].append({'googleSearch': {}})
+                    case 'w':
+                        kwargs['tools'].append({'urlContext': {}})
+                    case 'c':
+                        kwargs['tools'].append({'codeExecution': {}})
+                    case _:
+                        raise ValueError(f'Unknown tool option: {i}')
+        if model.get('system', ''):
+            kwargs['systemInstruction'] = {'parts': [{'text': model['system']}]}
+
+        async with session.post(
+            f'https://generativelanguage.googleapis.com/v1beta/models/{self.name}:generateContent',
+            headers={'x-goog-api-key': gemini_api_key},
+            json=kwargs,
+            timeout=aiohttp.ClientTimeout(total=3600),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError(f'Gemini API error: {response.status} {await response.text()}')
+            response = await response.json()
+        if 'candidates' not in response or len(response['candidates']) != 1:
+            raise RuntimeError('Gemini API error: no candidates')
+
+        text = f'[{model_short_name}]'
+        search_text = ''
+        content = response['candidates'][0]['content']
+        for part in content['parts']:
+            match part:
+                case {'executableCode': _}:
+                    text += '[运行代码]'
+                case {'codeExecutionResult': _}:
+                    pass
+                case {'text': s}:
+                    text += s
+                    search_text += s
+                case _:
+                    if len(part) == 1:
+                        text += f'[未知内容类型：{next(iter(part))}]'
+                    else:
+                        text += f'[未知内容类型：{part}]'
+        history.append(content)
+        return history, text, search_text
+
+
+@dataclasses.dataclass(frozen=True)
+class BaseModelGemini3(BaseModelGemini):
+    def thinking_config(self, model):
+        return {'thinkingLevel': model['reasoning']}
+
+
+@dataclasses.dataclass(frozen=True)
+class BaseModelGemini25(BaseModelGemini):
+    reasoning_options: list[str] = dataclasses.field(init=False)
+    default_reasoning: str | None = dataclasses.field(init=False)
+    thinking_zero: bool
+    thinking_min: int
+    thinking_max: int
+    default_thinking: int
+
+    def __post_init__(self):
+        if self.thinking_zero:
+            object.__setattr__(self, 'reasoning_options', ['dynamic', 'none', 'minimal', 'low', 'medium', 'high'])
+        else:
+            object.__setattr__(self, 'reasoning_options', ['dynamic', 'minimal', 'low', 'medium', 'high'])
+        match self.default_thinking:
+            case -1:
+                object.__setattr__(self, 'default_reasoning', 'dynamic')
+            case 0:
+                object.__setattr__(self, 'default_reasoning', 'none')
+            case _:
+                raise ValueError('Invalid default_thinking')
+
+    def clip_budget(self, budget):
+        if budget == -1:
+            return -1
+        if budget == 0 and self.thinking_zero:
+            return 0
+        return max(self.thinking_min, min(self.thinking_max, budget))
+
+    def thinking_config(self, model):
+        if isinstance(model['reasoning'], int):
+            budget = model['reasoning']
+        else:
+            budget = self.clip_budget({
+                'dynamic': -1,
+                'none': 0,
+                'minimal': 128,
+                'low': 1024,
+                'medium': 8192,
+                'high': 32768,
+            }[model['reasoning']])
+        return {'thinkingBudget': budget}
+
+
+base_models = [
+    BaseModelGPT5('gpt-5.2', '52', ['none', 'low', 'medium', 'high', 'xhigh'], 'none'),
+    BaseModelGPT5('gpt-5.1', '51', ['none', 'low', 'medium', 'high'], 'none'),
+    BaseModelGPT5('gpt-5', '5', ['minimal', 'low', 'medium', 'high'], 'medium'),
+    BaseModelGPT5('gpt-5-mini', '5m', ['minimal', 'low', 'medium', 'high'], 'medium'),
+    BaseModelGPT5('gpt-5-nano', '5n', ['minimal', 'low', 'medium', 'high'], 'medium'),
+    BaseModelGemini3('gemini-3-pro-preview', '3p', ['low', 'high'], 'high'),
+    BaseModelGemini3('gemini-3-flash-preview', '3f', ['minimal', 'low', 'medium', 'high'], 'high'),
+    BaseModelGemini25('gemini-2.5-pro', '25p', False, 128, 32768, -1),
+    BaseModelGemini25('gemini-2.5-flash', '25f', True, 0, 24576, -1),
+    BaseModelGemini25('gemini-2.5-flash-lite', '25l', True, 512, 24576, 0),
+]
+base_model_buttons = [
+    ['52', '5m', '5n'],
+    ['3p', '3f'],
+]
+
+
+def parse_base_model(name):
+    for i in base_models:
+        if i.short_name == name or i.name == name:
+            return i
+    if not name:
+        raise ValueError('Must specify a model')
+    if not re.fullmatch(r'[\w.-]+', name, re.ASCII):
+        raise ValueError(f'Invalid model name: {name}')
+    if name.startswith('gpt-'):
+        return BaseModelGPT5(name, name, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'], None)
+    if name.startswith('gemini-'):
+        return BaseModelGemini3(name, name, ['minimal', 'low', 'medium', 'high'], None)
+    raise ValueError(f'Model name must start with gpt- or gemini-: {name}')
+
+
 def parse_prefix(prefix):
     models = []
     for part in prefix.split(','):
@@ -181,42 +490,16 @@ def parse_prefix(prefix):
 
         s, *args = part.split('+')
         s = s.strip()
-        model = {
-            '52': 'gpt-5.2',
-            '51': 'gpt-5.1',
-            '5': 'gpt-5',
-            '5m': 'gpt-5-mini',
-            '5n': 'gpt-5-nano',
-            '25p': 'gemini-2.5-pro',
-            '25f': 'gemini-2.5-flash',
-            '25l': 'gemini-2.5-flash-lite',
-        }.get(s, s)
-        if not model:
-            raise ValueError(f'Must specify a model')
-        if not model.startswith(('gpt-', 'gemini-')):
-            raise ValueError(f'Model name must start with gpt- or gemini-: {model}')
-        if not re.fullmatch(r'(?a)[\w.-]+', model):
-            raise ValueError(f'Invalid model name: {model}')
-        model = {'model': model}
+        model = {'model': parse_base_model(s).name}
 
         model_type = model['model'].split('-', 1)[0]
         for arg in args:
             match arg[0], model_type:
-                case 'r', 'gpt':
+                case 'r', _:
                     s = arg[1:].strip()
                     if not s:
                         raise ValueError('Missing reasoning effort')
-                    for i in ['low', 'medium', 'high', 'minimal', 'none', 'xhigh']:
-                        if i.startswith(s.lower()):
-                            model['reasoning'] = i
-                            break
-                    else:
-                        raise ValueError(f'Unknown reasoning effort: {arg[1:]}')
-                case 'r', 'gemini':
-                    s = arg[1:].strip()
-                    if not s:
-                        raise ValueError('Missing reasoning effort')
-                    if re.fullmatch(r'(?a)\d+', s):
+                    if re.fullmatch(r'\d+', s, re.ASCII):
                         model['reasoning'] = int(s)
                     else:
                         for i in ['low', 'medium', 'high', 'minimal', 'none', 'dynamic', 'xhigh']:
@@ -267,22 +550,21 @@ def parse_prefix(prefix):
 def format_prefix(models, omit_system=False):
     parts = []
     for model in models:
-        s = model['model']
-        s = {
-            'gpt-5.2': '52',
-            'gpt-5.1': '51',
-            'gpt-5': '5',
-            'gpt-5-mini': '5m',
-            'gpt-5-nano': '5n',
-            'gemini-2.5-pro': '25p',
-            'gemini-2.5-flash': '25f',
-            'gemini-2.5-flash-lite': '25l',
-        }.get(s, s)
+        s = parse_base_model(model['model']).short_name
         if 'reasoning' in model:
+            s += '+r'
             if isinstance(model['reasoning'], int):
-                s += '+r' + str(model['reasoning'])
+                s += str(model['reasoning'])
             else:
-                s += '+r' + {'low': 'l', 'medium': 'm', 'high': 'h', 'minimal': 'min', 'none': 'n', 'dynamic': 'd', 'xhigh': 'x'}[model['reasoning']]
+                s += {
+                    'low': 'l',
+                    'medium': 'm',
+                    'high': 'h',
+                    'minimal': 'min',
+                    'none': 'n',
+                    'dynamic': 'd',
+                    'xhigh': 'x',
+                }[model['reasoning']]
         if 'verbosity' in model:
             s += '+v' + {'low': 'l', 'medium': 'm', 'high': 'h'}[model['verbosity']]
         if 'tools' in model:
@@ -296,18 +578,6 @@ def format_prefix(models, omit_system=False):
     return ','.join(parts)
 
 
-def gemini_reasoning_to_number(model, reasoning):
-    if isinstance(reasoning, int):
-        return reasoning
-    match model, reasoning:
-        case 'gemini-2.5-pro', 'high' | 'xhigh':
-            return 32768
-        case 'gemini-2.5-flash-lite', 'minimal':
-            return 512
-        case _:
-            return {'none': 0, 'minimal': 128, 'low': 1024, 'medium': 8192, 'high': 24576, 'dynamic': -1, 'xhigh': 24576}[reasoning]
-
-
 async def render_select_model_state(state, chat_id, message_id=None):
     kwargs = {
         'chat_id': chat_id,
@@ -317,25 +587,15 @@ async def render_select_model_state(state, chat_id, message_id=None):
     match state:
         case {'step': 'model'}:
             kwargs['text'] = '基础模型：请选择'
-            kwargs['reply_markup'] = {
-                'inline_keyboard': [
-                    [
-                        {'text': 'gpt-5.2', 'callback_data': 'm/gpt-5.2'},
-                        {'text': 'gpt-5-mini', 'callback_data': 'm/gpt-5-mini'},
-                        {'text': 'gpt-5-nano', 'callback_data': 'm/gpt-5-nano'},
-                    ],
-                    [
-                        {'text': 'gemini-2.5-pro', 'callback_data': 'm/gemini-2.5-pro'},
-                        {'text': 'gemini-2.5-flash', 'callback_data': 'm/gemini-2.5-flash'},
-                    ],
-                    [
-                        {'text': 'gemini-2.5-flash-lite', 'callback_data': 'm/gemini-2.5-flash-lite'},
-                    ],
-                    [
-                        {'text': '其他（不一定兼容）', 'callback_data': 'm/_other'},
-                    ],
-                ],
-            }
+            l = []
+            for row in base_model_buttons:
+                button_row = []
+                for i in row:
+                    base_model = parse_base_model(i)
+                    button_row.append({'text': base_model.name, 'callback_data': f'm/{base_model.name}'})
+                l.append(button_row)
+            l.append([{'text': '其他（不一定兼容）', 'callback_data': 'm/_other'}])
+            kwargs['reply_markup'] = {'inline_keyboard': l}
         case {'step': 'model-input'}:
             kwargs['text'] = state.get('error', '请回复 OpenAI 或 Gemini 模型名称')
             kwargs['reply_markup'] = {'force_reply': True, 'input_field_placeholder': 'gpt-... / gemini-...'}
@@ -344,22 +604,11 @@ async def render_select_model_state(state, chat_id, message_id=None):
             kwargs['reply_markup'] = {'force_reply': True, 'input_field_placeholder': '你是一个...'}
         case {'step': 'ready' | 'used' | 'invalid'}:
             lines = ['基础模型：' + escape_html(state['model'])]
+            base_model = parse_base_model(state['model'])
+            lines.append('推理努力：' + base_model.display_reasoning(state))
             model_type = state['model'].split('-', 1)[0]
             if model_type == 'gpt':
-                if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
-                    lines.append('推理努力：' + state.get('reasoning', '不指定（默认 none）'))
-                else:
-                    lines.append('推理努力：' + state.get('reasoning', '不指定（默认 medium）'))
                 lines.append('输出长度：' + state.get('verbosity', '不指定（默认 medium）'))
-            elif model_type == 'gemini':
-                if 'reasoning' not in state:
-                    lines.append('推理努力：不指定（默认自动决定）')
-                elif isinstance(state['reasoning'], int):
-                    lines.append(f'推理努力：{state["reasoning"]}')
-                else:
-                    v = gemini_reasoning_to_number(state['model'], state['reasoning'])
-                    s = {'none': f'无（{v}）', 'minimal': f'最低（{v}）', 'low': f'低（{v}）', 'medium': f'中（{v}）', 'high': f'高（{v}）', 'dynamic': '自动决定', 'xhigh': f'极高（{v}）'}[state['reasoning']]
-                    lines.append(f'推理努力：{s}')
             lines.append('在线搜索：' + ('开' if 's' in state.get('tools', '') else '关'))
             if model_type == 'gemini':
                 lines.append('查看网页：' + ('开' if 'w' in state.get('tools', '') else '关'))
@@ -382,22 +631,11 @@ async def render_select_model_state(state, chat_id, message_id=None):
             kwargs['text'] = '\n'.join(lines)
             keyboard = []
             keyboard.append([{'text': '修改基础模型', 'callback_data': 'm/_change'}])
+            l = [{'text': '推理：', 'callback_data': 'r/'}]
+            for i in base_model.reasoning_options:
+                l.append({'text': base_model.translate_reasoning(i), 'callback_data': f'r/{i}'})
+            keyboard.append(l)
             if model_type == 'gpt':
-                l = [
-                    {'text': '推理：', 'callback_data': 'r/'},
-                ]
-                if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
-                    l.append({'text': 'none', 'callback_data': 'r/none'})
-                else:
-                    l.append({'text': 'minimal', 'callback_data': 'r/minimal'})
-                l += [
-                    {'text': 'low', 'callback_data': 'r/low'},
-                    {'text': 'medium', 'callback_data': 'r/medium'},
-                    {'text': 'high', 'callback_data': 'r/high'},
-                ]
-                if state['model'] == 'gpt-5.2':
-                    l.append({'text': 'xhigh', 'callback_data': 'r/xhigh'})
-                keyboard.append(l)
                 keyboard.append([
                     {'text': '长度：', 'callback_data': 'v/'},
                     {'text': 'low', 'callback_data': 'v/low'},
@@ -415,19 +653,6 @@ async def render_select_model_state(state, chat_id, message_id=None):
                     }['c' in state.get('tools', '')],
                 ])
             elif model_type == 'gemini':
-                l = [
-                    {'text': '推理：', 'callback_data': 'r/'},
-                    {'text': '自动', 'callback_data': 'r/dynamic'},
-                ]
-                if state['model'] != 'gemini-2.5-pro':
-                    l.append({'text': '无', 'callback_data': 'r/none'})
-                l += [
-                    {'text': '最低', 'callback_data': 'r/minimal'},
-                    {'text': '低', 'callback_data': 'r/low'},
-                    {'text': '中', 'callback_data': 'r/medium'},
-                    {'text': '高', 'callback_data': 'r/high'},
-                ]
-                keyboard.append(l)
                 keyboard.append([
                     {
                         True: {'text': '在线搜索关', 'callback_data': 'tn/s'},
@@ -460,20 +685,11 @@ async def render_select_model_state(state, chat_id, message_id=None):
 
 
 def select_model_after_change_model(state):
+    base_model = parse_base_model(state['model'])
+    if 'reasoning' in state and state['reasoning'] not in base_model.reasoning_options:
+        del state['reasoning']
     model_type = state['model'].split('-', 1)[0]
     if model_type == 'gpt':
-        if state['model'] in {'gpt-5.1', 'gpt-5.2'}:
-            match state.get('reasoning', None):
-                case 'minimal':
-                    state['reasoning'] = 'none'
-                case 'dynamic':
-                    state['reasoning'] = 'medium'
-        else:
-            match state.get('reasoning', None):
-                case 'dynamic':
-                    del state['reasoning']
-                case 'none':
-                    state['reasoning'] = 'minimal'
         if 'w' in state.get('tools', ''):
             state['tools'] = state['tools'].replace('w', '')
             if not state['tools']:
@@ -801,12 +1017,7 @@ async def handle_message(message):
         safety_identifier = hashlib.sha256(f'{safety_identifier_salt},{from_id}'.encode()).hexdigest()
         for model in models:
             model_short_name = format_prefix([model], omit_system=True)
-            if model['model'].startswith('gpt-'):
-                asyncio.create_task(complete_and_reply_gpt(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
-            elif model['model'].startswith('gemini-'):
-                asyncio.create_task(complete_and_reply_gemini(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
-            else:
-                assert False
+            asyncio.create_task(complete_and_reply(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
 
     except Exception:
         if strict_privacy:
@@ -855,227 +1066,15 @@ async def handle_callback_query(callback_query):
         )
 
 
-async def complete_and_reply_gpt(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
+async def complete_and_reply(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
     try:
-        if 'system' in model:
-            assert history is None
-            if model['system']:
-                history = [{'role': 'system', 'content': [{'type': 'input_text', 'text': model['system']}] }]
-            del model['system']
-        if history is None:
-            history = []
-
-        content = []
-        if file:
-            if file['mime_type'].startswith('image/'):
-                content.append({
-                    'type': 'input_image',
-                    'image_url': f'data:{file["mime_type"]};base64,' + base64.b64encode(file['data']).decode(),
-                    'detail': 'high',
-                })
-            elif file['mime_type'] == 'application/pdf':
-                content.append({
-                    'type': 'input_file',
-                    'file_data': f'data:{file["mime_type"]};base64,' + base64.b64encode(file['data']).decode(),
-                } | ({'filename': file['name']} if 'name' in file else {}))
-            elif file['mime_type'].startswith('text/'):
-                if text:
-                    text = file['data'].decode(errors='replace') + '\n\n' + text
-                else:
-                    text = file['data'].decode(errors='replace')
-                content.append({
-                    'type': 'input_text',
-                    'text': text,
-                })
-                text = None
-            else:
-                assert False
-        if text:
-            content.append({
-                'type': 'input_text',
-                'text': text,
-            })
-        history.append({'role': 'user', 'content': content})
-
-        [openai_api_key] = db.execute('select value from config where key = ?', ['openai_api_key']).fetchone()
-        kwargs = {
-            'model': model['model'],
-            'include': ['reasoning.encrypted_content'],
-            'input': history,
-            'safety_identifier': safety_identifier,
-            'store': False,
-        }
-        if 'reasoning' in model:
-            kwargs['reasoning'] = {'effort': model['reasoning']}
-        if 'verbosity' in model:
-            kwargs['text'] = {'verbosity': model['verbosity']}
-        if 'tools' in model:
-            kwargs['tools'] = []
-            for i in model['tools']:
-                match i:
-                    case 's':
-                        kwargs['tools'].append({'type': 'web_search', 'search_context_size': 'high'})
-                    case 'c':
-                        kwargs['tools'].append({'type': 'code_interpreter', 'container': {'type': 'auto'}})
-                    case _:
-                        raise ValueError(f'Unknown tool option: {i}')
-
-        async with session.post(
-            'https://api.openai.com/v1/responses',
-            headers={'Authorization': f'Bearer {openai_api_key}'},
-            json=kwargs,
-            timeout=aiohttp.ClientTimeout(total=3600),
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f'OpenAI API error: {response.status} {await response.text()}')
-            response = await response.json()
-        if response['status'] != 'completed':
-            raise RuntimeError(f'OpenAI API error: status {response["status"]}')
-        if response['error'] is not None:
-            raise RuntimeError(f'OpenAI API error: error {response["error"]}')
-
-        text = f'[{model_short_name}]'
-        search_text = ''
-        for output in response['output']:
-            match output['type']:
-                case 'reasoning':
-                    history.append(output)
-                case 'web_search_call':
-                    text += '[网页搜索]'
-                case 'code_interpreter_call':
-                    text += '[运行代码]'
-                case 'message':
-                    history.append(output)
-                    for content in output['content']:
-                        match content['type']:
-                            case 'output_text':
-                                text += content['text']
-                                search_text += content['text']
-                            case type:
-                                text += f'[未知内容类型：{type}]'
-                case type:
-                    text += f'[未知输出类型：{type}]'
+        base_model = parse_base_model(model['model'])
+        history, text, search_text = await base_model.complete(model_short_name, model, history, file, text, safety_identifier)
 
         result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
         db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
             'type': 'history',
             'history': history,
-            'models': [model],
-        })])
-
-        db.execute('begin immediate')
-        with db:
-            db.execute('insert into search_data (chat_id, message_id, text, parent, time) values (?, ?, ?, ?, ?)', [chat_id, result['message_id'], search_text, message_id, result['date']])
-            parent_children, = db.execute('select children from search_data where chat_id = ? and message_id = ?', [chat_id, message_id]).fetchone()
-            if parent_children is None:
-                parent_children = []
-            else:
-                parent_children = deserialize(parent_children)
-            parent_children.append(result['message_id'])
-            db.execute('update search_data set children = ? where chat_id = ? and message_id = ?', [serialize_fast(parent_children), chat_id, message_id])
-
-    except Exception:
-        if strict_privacy:
-            try:
-                text = traceback.format_exc()
-                await telegram_send_text(chat_id, text, markdown=False)
-            except Exception:
-                pass
-        else:
-            text = traceback.format_exc()
-            await telegram_send_text(DEVELOPER, text, markdown=False)
-            await telegram_send_text(chat_id, '出错了，请重试。')
-
-
-async def complete_and_reply_gemini(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
-    try:
-        if history is None:
-            history = []
-
-        parts = []
-        if file:
-            if file['mime_type'].startswith('image/') or file['mime_type'] == 'application/pdf':
-                parts.append({
-                    'inline_data': {
-                        'mime_type': file['mime_type'],
-                        'data': base64.b64encode(file['data']).decode(),
-                    },
-                })
-            elif file['mime_type'].startswith('text/'):
-                if text:
-                    text = file['data'].decode(errors='replace') + '\n\n' + text
-                else:
-                    text = file['data'].decode(errors='replace')
-                parts.append({'text': text})
-                text = None
-            else:
-                assert False
-        if text:
-            parts.append({'text': text})
-        history.append({'role': 'user', 'parts': parts})
-
-        [gemini_api_key] = db.execute('select value from config where key = ?', ['gemini_api_key']).fetchone()
-        kwargs = {
-            'contents': history,
-            'safetySettings': [
-                {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'OFF'},
-                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'OFF'},
-                {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'OFF'},
-                {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'OFF'},
-                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'OFF'},
-            ],
-        }
-        if 'reasoning' in model:
-            kwargs['generationConfig'] = {'thinkingConfig': {'thinkingBudget': gemini_reasoning_to_number(model['model'], model['reasoning'])}}
-        if 'tools' in model:
-            kwargs['tools'] = []
-            for i in model['tools']:
-                match i:
-                    case 's':
-                        kwargs['tools'].append({'googleSearch': {}})
-                    case 'w':
-                        kwargs['tools'].append({'urlContext': {}})
-                    case 'c':
-                        kwargs['tools'].append({'codeExecution': {}})
-                    case _:
-                        raise ValueError(f'Unknown tool option: {i}')
-        if model.get('system', ''):
-            kwargs['systemInstruction'] = {'parts': [{'text': model['system']}]}
-
-        async with session.post(
-            f'https://generativelanguage.googleapis.com/v1beta/models/{model["model"]}:generateContent',
-            headers={'x-goog-api-key': gemini_api_key},
-            json=kwargs,
-            timeout=aiohttp.ClientTimeout(total=3600),
-        ) as response:
-            if response.status != 200:
-                raise RuntimeError(f'Gemini API error: {response.status} {await response.text()}')
-            response = await response.json()
-        if 'candidates' not in response or len(response['candidates']) != 1:
-            raise RuntimeError('Gemini API error: no candidates')
-
-        text = f'[{model_short_name}]'
-        search_text = ''
-        content = response['candidates'][0]['content']
-        for part in content['parts']:
-            match part:
-                case {'executableCode': _}:
-                    text += '[运行代码]'
-                case {'codeExecutionResult': _}:
-                    pass
-                case {'text': s}:
-                    text += s
-                    search_text += s
-                case _:
-                    if len(part) == 1:
-                        text += f'[未知内容类型：{next(iter(part))}]'
-                    else:
-                        text += f'[未知内容类型：{part}]'
-
-        result = await telegram_send_text(chat_id, text, reply_to_message_id=message_id)
-        db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?)', [chat_id, result['message_id'], serialize_fast({
-            'type': 'history',
-            'history': history + [content],
             'models': [model],
         })])
 
