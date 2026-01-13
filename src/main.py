@@ -374,8 +374,10 @@ class BaseModelGemini(BaseModel):
             if response.status != 200:
                 raise RuntimeError(f'Gemini API error: {response.status} {await response.text()}')
             response = await response.json()
-        if 'candidates' not in response or len(response['candidates']) != 1:
-            raise RuntimeError('Gemini API error: no candidates')
+        if 'candidates' not in response:
+            raise RuntimeError(f'Gemini API error: {await response.text()}')
+        if len(response['candidates']) != 1:
+            raise RuntimeError(f'Gemini API error: got {len(response["candidates"])} candidates')
 
         text = f'[{model_short_name}]'
         search_text = ''
