@@ -1019,7 +1019,7 @@ async def handle_message(message):
         safety_identifier = hashlib.sha256(f'{safety_identifier_salt},{from_id}'.encode()).hexdigest()
         for model in models:
             model_short_name = format_prefix([model], omit_system=True)
-            asyncio.create_task(complete_and_reply(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
+            asyncio.create_task(complete_and_reply(chat_id, from_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy))
 
     except Exception:
         if strict_privacy:
@@ -1029,7 +1029,8 @@ async def handle_message(message):
             except Exception:
                 pass
         else:
-            text = traceback.format_exc()
+            text = f'chat: {chat_id}\nfrom: {from_id}\n'
+            text += traceback.format_exc()
             await telegram_send_text(DEVELOPER, text, markdown=False)
             await telegram_send_text(chat_id, '出错了，请重试。')
 
@@ -1055,7 +1056,8 @@ async def handle_callback_query(callback_query):
             except Exception:
                 pass
         else:
-            text = traceback.format_exc()
+            text = f'chat: {chat_id}\nfrom: {callback_query["from"]["id"]}\n'
+            text += traceback.format_exc()
             await telegram_send_text(DEVELOPER, text, markdown=False)
             await telegram_send_text(chat_id, '出错了，请重试。')
     finally:
@@ -1068,7 +1070,7 @@ async def handle_callback_query(callback_query):
         )
 
 
-async def complete_and_reply(chat_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
+async def complete_and_reply(chat_id, from_id, message_id, model_short_name, model, history, file, text, safety_identifier, strict_privacy):
     try:
         base_model = parse_base_model(model['model'])
         history, text, search_text = await base_model.complete(model_short_name, model, history, file, text, safety_identifier)
@@ -1099,7 +1101,8 @@ async def complete_and_reply(chat_id, message_id, model_short_name, model, histo
             except Exception:
                 pass
         else:
-            text = traceback.format_exc()
+            text = f'chat: {chat_id}\nfrom: {from_id}\n'
+            text += traceback.format_exc()
             await telegram_send_text(DEVELOPER, text, markdown=False)
             await telegram_send_text(chat_id, '出错了，请重试。')
 
