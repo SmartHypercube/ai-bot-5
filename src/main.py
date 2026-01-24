@@ -787,7 +787,7 @@ async def handle_select_model_callback_query(state, callback_query):
             data['default_models'] = [{k: v for k, v in state.items() if k in {'model', 'reasoning', 'verbosity', 'tools', 'system'}}]
             db.execute('insert into chat (chat_id, data) values (?, ?) on conflict do update set data = excluded.data', [chat_id, serialize_fast(data)])
             state['step'] = 'used'
-            db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?) on conflict do update set data = excluded.data', [chat_id, message_id, serialize_fast(state)])
+            db.execute('insert into message (chat_id, message_id, data) values (?, ?, ?) on conflict do update set data = excluded.data', [chat_id, callback_query['message']['message_id'], serialize_fast(state)])
             await telegram_api(
                 'sendMessage',
                 chat_id=chat_id,
